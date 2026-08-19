@@ -1,0 +1,29 @@
+{
+  "name": "voiceqr",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Sesi kendi icinde tasiyan QR kod uretici ve oynatici",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "opus-decoder": "^0.7.11",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vite-plugin-pwa": "^1.3.0",
+    "vitest": "^4.1.11",
+    "zxing-wasm": "^3.1.3"
+  }
+}
