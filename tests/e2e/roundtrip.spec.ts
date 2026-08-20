@@ -176,3 +176,103 @@ test.describe('Oynatici hata durumlari', () => {
     await expect(page.getByRole('heading', { name: '1. Ses dosyası seçin' })).toBeVisible();
   });
 });
+
+/**
+ * Ortadan parca atma. Kanit icin uc parcali bir ton kullaniliyor:
+ * 300 Hz - 900 Hz - 300 Hz. Ortadaki atilirsa cikan seste 900 Hz KALMAMALI.
+ * "Bir sey kesildi" degil, "dogru yer kesildi" dogrulaniyor.
+ */
+test.describe('Ortadan parca atma', () => {
+  function ucParcaliTon(): Buffer {
+    const parcalar = [tone(300, 1, SAMPLE_RATE), tone(900, 1, SAMPLE_RATE), tone(300, 1, SAMPLE_RATE)];
+    const toplam = new Float32Array(parcalar.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (const p of parcalar) {
+      toplam.set(p, o);
+      o += p.length;
+    }
+    return makeWav(toplam, SAMPLE_RATE);
+  }
+
+  async function kur(page: Page): Promise<void> {
+    await page.goto('./');
+    await page.setInputFiles('#file', {
+      name: 'uc-parcali.wav',
+      mimeType: 'audio/wav',
+      buffer: ucParcaliTon(),
+    });
+    await expect(page.locator('#wave-canvas')).toBeVisible();
+    await page.selectOption('#bitrate', '6000');
+    await page.selectOption('#boost', 'kapali');
+
+    // Tum dosyayi sec - 6 kbps'te 3.6 sn siginiyor, 3 sn'lik dosya tamamen giriyor.
+    await page.locator('#start').fill('0');
+    await page.locator('#start').dispatchEvent('input');
+    await page.locator('#length').fill('1000');
+    await page.locator('#length').dispatchEvent('input');
+  }
+
+  async function sesiAl(page: Page) {
+    await generate(page);
+    const scanned = await scanGeneratedQr(page);
+    return playbackAudio(page, scanned.split('#')[1]!);
+  }
+
+  test('atilan bolum sesten GERCEKTEN cikiyor', async ({ page }) => {
+    await kur(page);
+
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    // Secimin %33-%66 araligi = ortadaki 900 Hz'lik saniye.
+    await page.locator('#cut-start').fill('333');
+    await page.locator('#cut-start').dispatchEvent('input');
+    await page.locator('#cut-length').fill('334');
+    await page.locator('#cut-length').dispatchEvent('input');
+
+    const { channels, sampleRate } = await sesiAl(page);
+    const signal = channels[0]!;
+
+    // 3 sn'den 1 sn atildi.
+    expect(signal.length / sampleRate).toBeGreaterThan(1.9);
+    expect(signal.length / sampleRate).toBeLessThan(2.2);
+
+    // Geriye yalnizca 300 Hz kalmali - 900 Hz atildi.
+    const baskin = dominantFrequency(signal, sampleRate, { min: 200, max: 1200, step: 5 });
+    expect(baskin).toBeGreaterThan(250);
+    expect(baskin).toBeLessThan(350);
+  });
+
+  test('atma kapaliyken ses tam kaliyor', async ({ page }) => {
+    await kur(page);
+    const { channels, sampleRate } = await sesiAl(page);
+    expect(channels[0]!.length / sampleRate).toBeGreaterThan(2.9);
+  });
+
+  test('atilan bolum butceden dusuluyor', async ({ page }) => {
+    await kur(page);
+    const oncesi = await page.locator('.metrics strong').first().textContent();
+
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    await page.locator('#cut-start').fill('333');
+    await page.locator('#cut-start').dispatchEvent('input');
+    await page.locator('#cut-length').fill('334');
+    await page.locator('#cut-length').dispatchEvent('input');
+
+    const sonrasi = await page.locator('.metrics strong').first().textContent();
+
+    // "Secili" degeri atilan sure kadar dusmeli: 3.00 -> 2.00
+    expect(parseFloat(oncesi!)).toBeGreaterThan(2.9);
+    expect(parseFloat(sonrasi!)).toBeLessThan(2.2);
+  });
+
+  test('iptal edilince ses tekrar tam oluyor', async ({ page }) => {
+    await kur(page);
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    await expect(page.locator('#cut-start')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Ortadan atmayı iptal et' }).click();
+    await expect(page.locator('#cut-start')).toHaveCount(0);
+
+    const { channels, sampleRate } = await sesiAl(page);
+    expect(channels[0]!.length / sampleRate).toBeGreaterThan(2.9);
+  });
+});

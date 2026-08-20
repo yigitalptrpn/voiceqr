@@ -238,3 +238,10 @@ button.ghost, .button.ghost { background: transparent; }
 .trim-row .hint {
   margin: 0;
 }
+
+/* Ortadan atilan bolumun kaydiraclari - secimden gorsel olarak ayrilsin. */
+.cut-block {
+  border-left: 2px solid rgba(255, 120, 140, 0.5);
+  padding-left: 0.75rem;
+  margin: 0.25rem 0 0.75rem;
+}
