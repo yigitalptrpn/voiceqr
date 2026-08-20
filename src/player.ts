@@ -10,7 +10,7 @@
  *     gosterilir - bu bir hata degil, beklenen davranistir.
  */
 
-import { decodeBase64url } from './codec/base64url';
+import { decodeFragment } from './codec/fragment';
 import { unpack } from './codec/container';
 import { decodePayload, type DecodedAudio } from './codec/decode';
 import { getAudioContext, resumeAudioContext } from './audio/loadFile';
@@ -142,7 +142,7 @@ function render(): void {
 
 async function prepare(fragment: string): Promise<void> {
   try {
-    const payload = unpack(decodeBase64url(fragment));
+    const payload = unpack(decodeFragment(fragment));
     const audio = decodePayload(payload);
     const decoded = await audio;
     const buffer = toAudioBuffer(getAudioContext(), decoded.channels, decoded.sampleRate);

@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { readBarcodesFromImageFile, setZXingModuleOverrides } from 'zxing-wasm/reader';
+import { maxAlphanumericChars } from '../../src/qr/capacity';
 import { dominantFrequency, makeWav, parseWav, rms, tone } from './helpers';
 
 const require = createRequire(import.meta.url);
@@ -19,6 +20,7 @@ test.beforeAll(async () => {
 });
 
 const SAMPLE_RATE = 16000;
+const URL_PREFIX = 'https://yigitalptrpn.github.io/voiceqr/#';
 
 async function uploadTone(page: Page, frequency: number, seconds: number): Promise<void> {
   await page.goto('./');
@@ -80,8 +82,14 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
 
     // QR, yerel adresi degil YAYINDAKI adresi tasimali - basilan kod
     // herkeste calismali.
-    expect(scanned).toContain('https://yigitalptrpn.github.io/voiceqr/#');
-    expect(scanned.length).toBeLessThanOrEqual(2953);
+    expect(scanned).toContain(URL_PREFIX);
+
+    // Yuk alfanumerik segmentte tasindigi icin adres, bayt modunun 2953
+    // karakterlik sinirini ASABILIR - QR'in alfanumerik kapasitesi daha genis.
+    // Sinir, kapasite matematiginin ilan ettigi kadar olmali.
+    const limit = URL_PREFIX.length + maxAlphanumericChars(URL_PREFIX.length, 'L');
+    expect(scanned.length).toBeLessThanOrEqual(limit);
+    expect(scanned.length).toBeGreaterThan(2953);
 
     const shown = await page.locator('.url-details summary').textContent();
     expect(shown).toContain(String(scanned.length));
@@ -110,7 +118,7 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
     expect(rms(middle)).toBeGreaterThan(0.2);
   });
 
-  test('varsayilan ayar (6 kbps / EC-L) yaklasik 2.9 saniye ses tasiyor', async ({ page }) => {
+  test('varsayilan ayar (6 kbps / EC-L) yaklasik 3.7 saniye ses tasiyor', async ({ page }) => {
     await uploadTone(page, 440, 10);
     await generate(page);
 
@@ -120,9 +128,11 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
     const scanned = await scanGeneratedQr(page);
     const { channels, sampleRate } = await playbackAudio(page, scanned.split('#')[1]!);
 
+    // base43 + alfanumerik QR modu kapasiteyi ~%29 buyuttu: eskiden 2.9 sn
+    // olan bu deger 3.7 sn'ye cikti. Gerileme olursa bu test yakalar.
     const seconds = channels[0]!.length / sampleRate;
-    expect(seconds).toBeGreaterThan(2.7);
-    expect(seconds).toBeLessThan(3.1);
+    expect(seconds).toBeGreaterThan(3.5);
+    expect(seconds).toBeLessThan(3.9);
     expect(rms(channels[0]!)).toBeGreaterThan(0.05);
   });
 

@@ -227,3 +227,14 @@ button.ghost, .button.ghost { background: transparent; }
   .spinner { animation-duration: 3s; }
   * { transition: none !important; }
 }
+
+/* Kirpma satiri: dugme ve aciklama yan yana, kaydiraclarin hemen altinda. */
+.trim-row {
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.25rem 0 0.75rem;
+}
+
+.trim-row .hint {
+  margin: 0;
+}

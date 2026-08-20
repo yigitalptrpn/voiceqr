@@ -10,13 +10,22 @@
 import { currentUrlPrefix, publicUrlPrefix } from './config';
 import { getAudioContext, loadAudioFile, resumeAudioContext } from './audio/loadFile';
 import { BOOST_LABEL, normalizeInPlace, type BoostLevel } from './audio/normalize';
+import { findSpeechBounds, trimSelection } from './audio/trim';
 import { extractMono } from './audio/resample';
 import { computePeaks, drawWaveform, type WaveformPeaks } from './audio/waveform';
-import { encodeBase64url } from './codec/base64url';
+import { encodeFragment } from './codec/fragment';
 import { encodeToPayload, estimateSeconds, isEncodingSupported, type ContentKind } from './codec/encode';
 import type { FrameDurationUs, SampleRate } from './codec/container';
-import { EC_LABEL, maxPayloadBytes, type EcLevel } from './qr/capacity';
-import { measureQr, renderToCanvas, toPngBlob, toSvgString, type QrRenderResult } from './qr/render';
+import { EC_LABEL, maxPayloadBytesAlphanumeric, type EcLevel } from './qr/capacity';
+import {
+  measureQr,
+  renderToCanvas,
+  toPngBlob,
+  toSvgString,
+  urlText,
+  type QrRenderResult,
+  type QrUrl,
+} from './qr/render';
 
 const SAMPLE_RATE: SampleRate = 16000;
 const FRAME_DURATION: FrameDurationUs = 60000;
@@ -37,7 +46,14 @@ interface State {
   /** Kodlamadan onceki ses yukseltme seviyesi. */
   boost: BoostLevel;
   /** Uretilmis link ve olcumleri; ayar degisince temizlenir. */
-  result: { url: string; publicUrl: string; qr: QrRenderResult; seconds: number; truncated: boolean } | null;
+  result: {
+    url: string;
+    publicUrl: QrUrl;
+    qr: QrRenderResult;
+    seconds: number;
+    truncated: boolean;
+    usedVbr: boolean;
+  } | null;
   busy: boolean;
   error: string | null;
 }
@@ -58,7 +74,7 @@ const state: State = {
 
 /** Su anki ayarlarla QR'a sigacak azami ham bayt. */
 function budgetBytes(): number {
-  return maxPayloadBytes(publicUrlPrefix().length, state.ec);
+  return maxPayloadBytesAlphanumeric(publicUrlPrefix().length, state.ec);
 }
 
 /** Su anki ayarlarla sigacak azami ses suresi (saniye). */
@@ -132,13 +148,14 @@ async function generate(): Promise<void> {
     const encoded = await encodeToPayload(pcm, {
       bitrate: state.bitrate,
       content: state.content,
+      preferVbr: true,
       frameDurationUs: FRAME_DURATION,
       sampleRate: SAMPLE_RATE,
       maxBytes: budgetBytes(),
     });
 
-    const fragment = encodeBase64url(encoded.bytes);
-    const publicUrl = publicUrlPrefix() + fragment;
+    const fragment = encodeFragment(encoded.bytes);
+    const publicUrl: QrUrl = { prefix: publicUrlPrefix(), payload: fragment };
     const localUrl = currentUrlPrefix() + fragment;
 
     // QR her zaman YAYINDAKI adresi tasir - kullanici yerelde uretse bile
@@ -154,6 +171,7 @@ async function generate(): Promise<void> {
       qr,
       seconds: encoded.encodedSeconds,
       truncated: encoded.truncated,
+      usedVbr: encoded.usedVbr,
     };
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
@@ -194,10 +212,15 @@ async function acceptFile(file: File): Promise<void> {
     state.buffer = buffer;
     state.peaks = computePeaks(buffer, WAVE_BUCKETS);
 
-    // Baslangicta bastan itibaren sigacak kadarini sec - kullanici
-    // hicbir sey yapmadan da gecerli bir secimle karsilassin.
-    const fits = Math.min(budgetSeconds(), buffer.duration);
-    state.selection = { start: 0, end: fits / buffer.duration };
+    // Baslangic secimi sifirdan degil, SESIN BASLADIGI yerden. Telefon
+    // kayitlarinin basinda cogu zaman bir sessizlik oluyor; sifirdan
+    // baslamak butcenin buyuk bir kismini hiclik kodlamaya harciyordu.
+    const speech = findSpeechBounds(buffer.getChannelData(0), buffer.sampleRate);
+    const fits = Math.min(budgetSeconds(), Math.max(0.01, buffer.duration - speech.startSeconds));
+    state.selection = {
+      start: speech.startSeconds / buffer.duration,
+      end: (speech.startSeconds + fits) / buffer.duration,
+    };
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
     state.file = null;
@@ -207,6 +230,30 @@ async function acceptFile(file: File): Promise<void> {
     state.busy = false;
     render();
   }
+}
+
+/**
+ * Kullanicinin sectigi pencerenin KENARLARINDAKI sessizligi atar.
+ *
+ * Secimin disina tasmaz - kullanici bir yeri bilerek sectiyse arac onu baska
+ * bir yere kaydirmamali. Kirpma sonrasi yer acilirsa butce izin verdigi
+ * olcude sondan uzatiyoruz, boylece kazanilan sure sese donusuyor.
+ */
+function trimCurrentSelection(): void {
+  if (!state.buffer) return;
+  const duration = state.buffer.duration;
+
+  const trimmed = trimSelection(state.buffer.getChannelData(0), state.buffer.sampleRate, {
+    startSeconds: state.selection.start * duration,
+    endSeconds: state.selection.end * duration,
+  });
+
+  const maxSeconds = Math.min(budgetSeconds(), duration - trimmed.startSeconds);
+  const end = Math.min(trimmed.startSeconds + maxSeconds, Math.max(trimmed.endSeconds, trimmed.startSeconds + 0.01));
+
+  state.selection = { start: trimmed.startSeconds / duration, end: end / duration };
+  state.result = null;
+  render();
 }
 
 /** Secimi butceye sigdirir; bitrate/EC degisince cagrilir. */
@@ -270,6 +317,10 @@ function resultPanel(): string {
         <div class="metric"><span class="metric-label">Ses</span><strong>${fmt(r.seconds)}</strong></div>
         <div class="metric"><span class="metric-label">QR sürümü</span><strong>v${r.qr.version} (${r.qr.modules}×${r.qr.modules})</strong></div>
         <div class="metric"><span class="metric-label">Doluluk</span><strong>%${Math.round(r.qr.fillRatio * 100)}</strong></div>
+        <div class="metric">
+          <span class="metric-label">Kodlama</span>
+          <strong>${r.usedVbr ? 'VBR' : 'CBR'}</strong>
+        </div>
       </div>
       ${r.truncated ? '<p class="warn">Ses bütçeye sığmadığı için sondan kırpıldı.</p>' : ''}
       <p class="print-note">
@@ -284,8 +335,8 @@ function resultPanel(): string {
         <a class="button" href="${r.url}" target="_blank" rel="noopener">Oynatıcıda dene</a>
       </div>
       <details class="url-details">
-        <summary>QR'ın içindeki adres (${r.publicUrl.length} karakter)</summary>
-        <code class="url">${r.publicUrl.slice(0, 120)}...</code>
+        <summary>QR'ın içindeki adres (${urlText(r.publicUrl).length} karakter)</summary>
+        <code class="url">${urlText(r.publicUrl).slice(0, 120)}...</code>
         <p class="hint">
           Bu adres <code>${publicUrlPrefix()}</code> ile başlıyor. Site bu adreste
           yayında olmadıkça basılan QR çalışmaz.
@@ -350,6 +401,10 @@ function render(): void {
           <input type="range" id="length" min="1" max="1000" step="1"
                  value="${Math.round((state.selection.end - state.selection.start) * 1000)}" />
           <span class="range-value">${fmt(selectionSeconds())}</span>
+        </div>
+        <div class="actions trim-row">
+          <button type="button" class="ghost" data-action="trim">Sessizliği kırp</button>
+          <span class="hint">Seçimin başındaki ve sonundaki boşluğu atar — bütçe sese kalır.</span>
         </div>
 
         ${statusLine()}
@@ -443,12 +498,13 @@ function bind(root: HTMLElement): void {
     const action = target.closest('[data-action]')?.getAttribute('data-action');
     if (!action) return;
 
+    if (action === 'trim') trimCurrentSelection();
     if (action === 'preview') void playSelection();
     if (action === 'generate') void generate();
     if (action === 'png') void download('png');
     if (action === 'svg') void download('svg');
     if (action === 'copy' && state.result) {
-      void navigator.clipboard.writeText(state.result.publicUrl).then(
+      void navigator.clipboard.writeText(urlText(state.result.publicUrl)).then(
         () => {
           (target as HTMLButtonElement).textContent = 'Kopyalandı';
           setTimeout(() => ((target as HTMLButtonElement).textContent = 'Linki kopyala'), 1500);

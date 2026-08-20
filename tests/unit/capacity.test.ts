@@ -1,10 +1,13 @@
 import QRCode from 'qrcode';
 import { describe, expect, it } from 'vitest';
 import { estimateSeconds } from '../../src/codec/encode';
+import { encodeBase43 } from '../../src/codec/base43';
 import {
   base64urlLength,
   bytesFromBase64urlLength,
+  maxAlphanumericChars,
   maxPayloadBytes,
+  maxPayloadBytesAlphanumeric,
   QR_V40_BYTE_CAPACITY,
   QR_V40_MODULES,
   recommendedPrintSizeMm,
@@ -99,5 +102,55 @@ describe('QR kapasite matematigi', () => {
     const mm = recommendedPrintSizeMm(QR_V40_MODULES);
     expect(mm).toBeGreaterThanOrEqual(70);
     expect(mm).toBeLessThanOrEqual(120);
+  });
+});
+
+/**
+ * Karisik mod kapasitesi. Bu blogun tamami sabitleri degil, TURETILEN
+ * matematigi gercek `qrcode` kutuphanesine karsi dogruluyor - kapasite bir
+ * karakter bile fazla ilan edilirse uretici "sigar" deyip uretim aninda
+ * patlar, hem de yalnizca en uzun seslerde.
+ */
+describe('karisik mod (bayt onek + alfanumerik yuk) kapasitesi', () => {
+  const ONEK = 'https://yigitalptrpn.github.io/voiceqr/#';
+
+  function mixedQr(prefix: string, alnumChars: number, ec: EcLevel) {
+    return QRCode.create(
+      [
+        { data: new TextEncoder().encode(prefix), mode: 'byte' },
+        { data: 'A'.repeat(alnumChars), mode: 'alphanumeric' },
+      ],
+      { errorCorrectionLevel: ec },
+    );
+  }
+
+  it.each(EC_LEVELS)('%s: ilan edilen karakter sayisi tam sigar', (ec) => {
+    const chars = maxAlphanumericChars(ONEK.length, ec);
+    expect(mixedQr(ONEK, chars, ec).version).toBe(40);
+  });
+
+  it.each(EC_LEVELS)('%s: bir karakter fazlasi tasar', (ec) => {
+    const chars = maxAlphanumericChars(ONEK.length, ec);
+    expect(() => mixedQr(ONEK, chars + 1, ec)).toThrow();
+  });
+
+  it.each(EC_LEVELS)('%s: base43 yuku ilan edilen bayt kadar gercekten sigar', (ec) => {
+    const bytes = maxPayloadBytesAlphanumeric(ONEK.length, ec);
+    const payload = encodeBase43(new Uint8Array(bytes).fill(0xab));
+    expect(mixedQr(ONEK, payload.length, ec).version).toBe(40);
+  });
+
+  it.each(EC_LEVELS)('%s: base64url yerine base43 daha cok ses tasir', (ec) => {
+    const eski = maxPayloadBytes(ONEK.length, ec);
+    const yeni = maxPayloadBytesAlphanumeric(ONEK.length, ec);
+    expect(yeni).toBeGreaterThan(eski);
+    // Olculen kazanc her seviyede ~%29; gerilemeyi yakalamak icin alt sinir.
+    expect(yeni / eski).toBeGreaterThan(1.25);
+  });
+
+  it('onek uzadikca kapasite duser', () => {
+    const kisa = maxPayloadBytesAlphanumeric(20, 'L');
+    const uzun = maxPayloadBytesAlphanumeric(60, 'L');
+    expect(uzun).toBeLessThan(kisa);
   });
 });
