@@ -9,13 +9,24 @@
 
 import { currentUrlPrefix, publicUrlPrefix } from './config';
 import { getAudioContext, loadAudioFile, resumeAudioContext } from './audio/loadFile';
-import { extractMono } from './audio/resample';
+import { BOOST_LABEL, normalizeInPlace, type BoostLevel } from './audio/normalize';
+import { concatWithCrossfade } from './audio/splice';
+import { findSpeechBounds, trimSelection } from './audio/trim';
+import { extractMono, toAudioBuffer } from './audio/resample';
 import { computePeaks, drawWaveform, type WaveformPeaks } from './audio/waveform';
-import { encodeBase64url } from './codec/base64url';
-import { encodeToPayload, estimateSeconds, isEncodingSupported } from './codec/encode';
+import { encodeFragment } from './codec/fragment';
+import { encodeToPayload, estimateSeconds, isEncodingSupported, type ContentKind } from './codec/encode';
 import type { FrameDurationUs, SampleRate } from './codec/container';
-import { EC_LABEL, maxPayloadBytes, type EcLevel } from './qr/capacity';
-import { measureQr, renderToCanvas, toPngBlob, toSvgString, type QrRenderResult } from './qr/render';
+import { EC_LABEL, maxPayloadBytesAlphanumeric, type EcLevel } from './qr/capacity';
+import {
+  measureQr,
+  renderToCanvas,
+  toPngBlob,
+  toSvgString,
+  urlText,
+  type QrRenderResult,
+  type QrUrl,
+} from './qr/render';
 
 const SAMPLE_RATE: SampleRate = 16000;
 const FRAME_DURATION: FrameDurationUs = 60000;
@@ -29,10 +40,27 @@ interface State {
   peaks: WaveformPeaks | null;
   /** Secim, kaynak sesin 0..1 orani olarak. */
   selection: { start: number; end: number };
+  /**
+   * Secimin ICINDEN atilacak bolum, yine kaynagin 0..1 orani olarak.
+   * `null` ise bir sey atilmiyor. Atilan yerin oncesi ve sonrasi
+   * birlestirilip tek ses olur.
+   */
+  cut: { start: number; end: number } | null;
   bitrate: number;
   ec: EcLevel;
+  /** Kodlayiciya verilen icerik ipucu; kaliteyi belirgin etkiler. */
+  content: ContentKind;
+  /** Kodlamadan onceki ses yukseltme seviyesi. */
+  boost: BoostLevel;
   /** Uretilmis link ve olcumleri; ayar degisince temizlenir. */
-  result: { url: string; publicUrl: string; qr: QrRenderResult; seconds: number; truncated: boolean } | null;
+  result: {
+    url: string;
+    publicUrl: QrUrl;
+    qr: QrRenderResult;
+    seconds: number;
+    truncated: boolean;
+    usedVbr: boolean;
+  } | null;
   busy: boolean;
   error: string | null;
 }
@@ -42,8 +70,11 @@ const state: State = {
   buffer: null,
   peaks: null,
   selection: { start: 0, end: 1 },
+  cut: null,
   bitrate: 6000,
   ec: 'L',
+  content: 'konusma',
+  boost: 'orta',
   result: null,
   busy: false,
   error: null,
@@ -51,7 +82,7 @@ const state: State = {
 
 /** Su anki ayarlarla QR'a sigacak azami ham bayt. */
 function budgetBytes(): number {
-  return maxPayloadBytes(publicUrlPrefix().length, state.ec);
+  return maxPayloadBytesAlphanumeric(publicUrlPrefix().length, state.ec);
 }
 
 /** Su anki ayarlarla sigacak azami ses suresi (saniye). */
@@ -59,13 +90,97 @@ function budgetSeconds(): number {
   return estimateSeconds(budgetBytes(), state.bitrate, FRAME_DURATION);
 }
 
-function selectionSeconds(): number {
+/** Secimin ham genisligi - atilan bolum DAHIL. */
+function selectionSpanSeconds(): number {
   if (!state.buffer) return 0;
   return (state.selection.end - state.selection.start) * state.buffer.duration;
 }
 
+/** Secimin icinden atilan bolumun suresi. Atilan yoksa 0. */
+function cutSeconds(): number {
+  if (!state.buffer || !state.cut) return 0;
+  const from = Math.max(state.cut.start, state.selection.start);
+  const to = Math.min(state.cut.end, state.selection.end);
+  return Math.max(0, (to - from) * state.buffer.duration);
+}
+
+/**
+ * QR'a girecek GERCEK ses suresi: secim eksi atilan bolum.
+ *
+ * Butce hesaplari hep bunu kullanmali - atilan yer QR'da yer kaplamiyor,
+ * dolayisiyla kullanici o kadar daha uzun bir aralik secebilir.
+ */
+function selectionSeconds(): number {
+  return Math.max(0, selectionSpanSeconds() - cutSeconds());
+}
+
 function fmt(seconds: number): string {
   return `${seconds.toFixed(2)} sn`;
+}
+
+/**
+ * Secili sesi mono PCM olarak cikarir; ortadan bir bolum atildiysa kalan iki
+ * parcayi birlestirir.
+ *
+ * Birlestirme duz yapistirma DEGIL: ek yerinde kisa bir capraz gecis var,
+ * aksi halde duyulur bir tik olusuyor (bkz. `src/audio/splice.ts`).
+ */
+async function extractSelection(): Promise<Float32Array<ArrayBuffer>> {
+  if (!state.buffer) return new Float32Array(0);
+  const duration = state.buffer.duration;
+  const from = state.selection.start * duration;
+  const to = state.selection.end * duration;
+
+  const cut = effectiveCut();
+  if (!cut) {
+    return extractMono(state.buffer, {
+      startSeconds: from,
+      durationSeconds: to - from,
+      targetSampleRate: SAMPLE_RATE,
+    });
+  }
+
+  const [once, sonra] = await Promise.all([
+    extractMono(state.buffer, {
+      startSeconds: from,
+      durationSeconds: Math.max(0, cut.start * duration - from),
+      targetSampleRate: SAMPLE_RATE,
+    }),
+    extractMono(state.buffer, {
+      startSeconds: cut.end * duration,
+      durationSeconds: Math.max(0, to - cut.end * duration),
+      targetSampleRate: SAMPLE_RATE,
+    }),
+  ]);
+
+  return concatWithCrossfade(once, sonra, SAMPLE_RATE);
+}
+
+/**
+ * Atilan bolumun kaydiraclarda gosterilecek konumu.
+ *
+ * Kaydiraclar kaynagin tamamina gore degil SECIME gore calisiyor: kullanici
+ * secimi daralttiginda atilan bolumun kaydiraci da onunla birlikte olceklensin,
+ * yoksa kaydirac secimin disina isaret ederdi.
+ */
+function cutRatioInSelection(value: number): number {
+  const span = state.selection.end - state.selection.start;
+  if (span <= 0) return 0;
+  return Math.max(0, Math.min(1, (value - state.selection.start) / span));
+}
+
+function cutWidthInSelection(): number {
+  const span = state.selection.end - state.selection.start;
+  if (span <= 0 || !state.cut) return 0;
+  return Math.max(0, Math.min(1, (state.cut.end - state.cut.start) / span));
+}
+
+/** Atilan bolumun secimle kesisen kismi; kesisim yoksa `null`. */
+function effectiveCut(): { start: number; end: number } | null {
+  if (!state.cut) return null;
+  const start = Math.max(state.cut.start, state.selection.start);
+  const end = Math.min(state.cut.end, state.selection.end);
+  return end > start ? { start, end } : null;
 }
 
 // --- Ses onizleme -----------------------------------------------------------
@@ -83,21 +198,29 @@ function stopPreview(): void {
   }
 }
 
+/**
+ * Onizleme, QR'a girecek sesin AYNISINI calar: secili aralik, ortadan atilan
+ * bolum cikarilmis ve ek yeri capraz gecisle birlestirilmis halde. Kullanici
+ * "atilan yer dogru mu" sorusunu ancak boyle yanitlayabilir.
+ */
 async function playSelection(): Promise<void> {
   if (!state.buffer) return;
   stopPreview();
   await resumeAudioContext();
 
+  const pcm = await extractSelection();
+  if (pcm.length === 0) return;
+
   const ctx = getAudioContext();
   const node = ctx.createBufferSource();
-  node.buffer = state.buffer;
+  node.buffer = toAudioBuffer(ctx, [pcm], SAMPLE_RATE);
   node.connect(ctx.destination);
   node.onended = () => {
     if (preview === node) preview = null;
   };
 
-  const start = state.selection.start * state.buffer.duration;
-  node.start(0, start, Math.max(0.01, selectionSeconds()));
+  // Tampon zaten yalnizca calinacak sesi iceriyor - atlama/kirpma gerekmiyor.
+  node.start();
   preview = node;
 }
 
@@ -112,21 +235,23 @@ async function generate(): Promise<void> {
   render();
 
   try {
-    const pcm = await extractMono(state.buffer, {
-      startSeconds: state.selection.start * state.buffer.duration,
-      durationSeconds: selectionSeconds(),
-      targetSampleRate: SAMPLE_RATE,
-    });
+    const pcm = await extractSelection();
+
+    // Kisik kayit telefon hoparlorunde duyulmaz. Yukseltme ortalama gurluge
+    // gore yapiliyor; ayrintisi ve neden tepeye gore olmadigi normalize.ts'te.
+    normalizeInPlace(pcm, state.boost);
 
     const encoded = await encodeToPayload(pcm, {
       bitrate: state.bitrate,
+      content: state.content,
+      preferVbr: true,
       frameDurationUs: FRAME_DURATION,
       sampleRate: SAMPLE_RATE,
       maxBytes: budgetBytes(),
     });
 
-    const fragment = encodeBase64url(encoded.bytes);
-    const publicUrl = publicUrlPrefix() + fragment;
+    const fragment = encodeFragment(encoded.bytes);
+    const publicUrl: QrUrl = { prefix: publicUrlPrefix(), payload: fragment };
     const localUrl = currentUrlPrefix() + fragment;
 
     // QR her zaman YAYINDAKI adresi tasir - kullanici yerelde uretse bile
@@ -142,6 +267,7 @@ async function generate(): Promise<void> {
       qr,
       seconds: encoded.encodedSeconds,
       truncated: encoded.truncated,
+      usedVbr: encoded.usedVbr,
     };
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
@@ -181,11 +307,18 @@ async function acceptFile(file: File): Promise<void> {
     state.file = file;
     state.buffer = buffer;
     state.peaks = computePeaks(buffer, WAVE_BUCKETS);
+    // Onceki kaydin atilan bolumu yeni kayda uymaz.
+    state.cut = null;
 
-    // Baslangicta bastan itibaren sigacak kadarini sec - kullanici
-    // hicbir sey yapmadan da gecerli bir secimle karsilassin.
-    const fits = Math.min(budgetSeconds(), buffer.duration);
-    state.selection = { start: 0, end: fits / buffer.duration };
+    // Baslangic secimi sifirdan degil, SESIN BASLADIGI yerden. Telefon
+    // kayitlarinin basinda cogu zaman bir sessizlik oluyor; sifirdan
+    // baslamak butcenin buyuk bir kismini hiclik kodlamaya harciyordu.
+    const speech = findSpeechBounds(buffer.getChannelData(0), buffer.sampleRate);
+    const fits = Math.min(budgetSeconds(), Math.max(0.01, buffer.duration - speech.startSeconds));
+    state.selection = {
+      start: speech.startSeconds / buffer.duration,
+      end: (speech.startSeconds + fits) / buffer.duration,
+    };
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
     state.file = null;
@@ -197,10 +330,60 @@ async function acceptFile(file: File): Promise<void> {
   }
 }
 
+/**
+ * Kullanicinin sectigi pencerenin KENARLARINDAKI sessizligi atar.
+ *
+ * Secimin disina tasmaz - kullanici bir yeri bilerek sectiyse arac onu baska
+ * bir yere kaydirmamali. Kirpma sonrasi yer acilirsa butce izin verdigi
+ * olcude sondan uzatiyoruz, boylece kazanilan sure sese donusuyor.
+ */
+function trimCurrentSelection(): void {
+  if (!state.buffer) return;
+  const duration = state.buffer.duration;
+
+  const trimmed = trimSelection(state.buffer.getChannelData(0), state.buffer.sampleRate, {
+    startSeconds: state.selection.start * duration,
+    endSeconds: state.selection.end * duration,
+  });
+
+  const maxSeconds = Math.min(budgetSeconds(), duration - trimmed.startSeconds);
+  const end = Math.min(trimmed.startSeconds + maxSeconds, Math.max(trimmed.endSeconds, trimmed.startSeconds + 0.01));
+
+  state.selection = { start: trimmed.startSeconds / duration, end: end / duration };
+  state.result = null;
+  render();
+}
+
+/**
+ * Ortadan atmayi acar/kapatir.
+ *
+ * Acilirken atilan bolum secimin ortasina, secimin besde biri genisliginde
+ * yerlestiriliyor - kullanici sifir genislikte bir kaydiracla ugrasmasin,
+ * dogrudan gorunur bir sey bulsun ve oradan tasisin.
+ */
+function toggleCut(): void {
+  if (!state.buffer) return;
+
+  if (state.cut) {
+    state.cut = null;
+  } else {
+    const { start, end } = state.selection;
+    const width = (end - start) / 5;
+    const center = (start + end) / 2;
+    state.cut = { start: center - width / 2, end: center + width / 2 };
+  }
+
+  state.result = null;
+  render();
+}
+
 /** Secimi butceye sigdirir; bitrate/EC degisince cagrilir. */
 function clampSelectionToBudget(): void {
   if (!state.buffer) return;
-  const maxRatio = Math.min(1, budgetSeconds() / state.buffer.duration);
+  // Atilan bolum QR'da yer kaplamadigi icin secim onun kadar daha genis
+  // olabilir; sinir ham genislige degil, GERCEK sese konuyor.
+  const allowedSpan = budgetSeconds() + cutSeconds();
+  const maxRatio = Math.min(1, allowedSpan / state.buffer.duration);
   const width = state.selection.end - state.selection.start;
   if (width > maxRatio) {
     state.selection.end = state.selection.start + maxRatio;
@@ -215,9 +398,12 @@ function redrawWaveform(): void {
   drawWaveform(canvas, {
     peaks: state.peaks,
     selection: state.selection,
+    cut: effectiveCut(),
     waveColor: '#3a4152',
     selectedWaveColor: '#7cc4ff',
     selectionFill: 'rgba(124, 196, 255, 0.12)',
+    cutWaveColor: '#6b4a5a',
+    cutFill: 'rgba(255, 120, 140, 0.14)',
   });
 }
 
@@ -258,6 +444,10 @@ function resultPanel(): string {
         <div class="metric"><span class="metric-label">Ses</span><strong>${fmt(r.seconds)}</strong></div>
         <div class="metric"><span class="metric-label">QR sürümü</span><strong>v${r.qr.version} (${r.qr.modules}×${r.qr.modules})</strong></div>
         <div class="metric"><span class="metric-label">Doluluk</span><strong>%${Math.round(r.qr.fillRatio * 100)}</strong></div>
+        <div class="metric">
+          <span class="metric-label">Kodlama</span>
+          <strong>${r.usedVbr ? 'VBR' : 'CBR'}</strong>
+        </div>
       </div>
       ${r.truncated ? '<p class="warn">Ses bütçeye sığmadığı için sondan kırpıldı.</p>' : ''}
       <p class="print-note">
@@ -272,8 +462,8 @@ function resultPanel(): string {
         <a class="button" href="${r.url}" target="_blank" rel="noopener">Oynatıcıda dene</a>
       </div>
       <details class="url-details">
-        <summary>QR'ın içindeki adres (${r.publicUrl.length} karakter)</summary>
-        <code class="url">${r.publicUrl.slice(0, 120)}...</code>
+        <summary>QR'ın içindeki adres (${urlText(r.publicUrl).length} karakter)</summary>
+        <code class="url">${urlText(r.publicUrl).slice(0, 120)}...</code>
         <p class="hint">
           Bu adres <code>${publicUrlPrefix()}</code> ile başlıyor. Site bu adreste
           yayında olmadıkça basılan QR çalışmaz.
@@ -306,7 +496,9 @@ function render(): void {
       <section class="panel">
         <h2>1. Ses dosyası seçin</h2>
         <div id="drop" class="drop ${hasAudio ? 'has-file' : ''}" tabindex="0" role="button">
-          <input type="file" id="file" accept="audio/*" hidden />
+          <!-- Video de kabul ediliyor: decodeAudioData, mp4/mov icindeki ses
+               parcasini cozer, telefon kayitlari cogunlukla bu bicimde gelir. -->
+          <input type="file" id="file" accept="audio/*,video/*" hidden />
           ${
             hasAudio
               ? `<strong>${state.file?.name ?? 'ses'}</strong>
@@ -314,7 +506,7 @@ function render(): void {
                  ${state.buffer!.sampleRate} Hz</span>
                  <span class="hint">Değiştirmek için tıklayın veya yeni dosya bırakın</span>`
               : `<strong>Dosyayı buraya bırakın</strong>
-                 <span>ya da tıklayıp seçin (mp3, m4a, wav, ogg...)</span>`
+                 <span>ya da tıklayıp seçin (mp3, m4a, wav, ogg, mp4...)</span>`
           }
         </div>
       </section>
@@ -337,6 +529,37 @@ function render(): void {
                  value="${Math.round((state.selection.end - state.selection.start) * 1000)}" />
           <span class="range-value">${fmt(selectionSeconds())}</span>
         </div>
+        <div class="actions trim-row">
+          <button type="button" class="ghost" data-action="trim">Sessizliği kırp</button>
+          <button type="button" class="ghost" data-action="cut-toggle">
+            ${state.cut ? 'Ortadan atmayı iptal et' : 'Ortadan parça at'}
+          </button>
+          <span class="hint">Seçimin başındaki ve sonundaki boşluğu atar — bütçe sese kalır.</span>
+        </div>
+        ${
+          state.cut
+            ? `
+        <div class="cut-block">
+          <div class="range-row">
+            <label for="cut-start">Atılan başlangıç</label>
+            <input type="range" id="cut-start" min="0" max="1000" step="1"
+                   value="${Math.round(cutRatioInSelection(state.cut.start) * 1000)}" />
+            <span class="range-value">${fmt(state.cut.start * state.buffer!.duration)}</span>
+          </div>
+          <div class="range-row">
+            <label for="cut-length">Atılan uzunluk</label>
+            <input type="range" id="cut-length" min="0" max="1000" step="1"
+                   value="${Math.round(cutWidthInSelection() * 1000)}" />
+            <span class="range-value">${fmt(cutSeconds())}</span>
+          </div>
+          <p class="hint">
+            Kırmızı bölge QR'a girmez; öncesi ve sonrası birleştirilir.
+            Birleşme yerinde tıklama olmaması için kısa bir geçiş uygulanır.
+            <strong>Dinle</strong> ile sonucu duyabilirsiniz.
+          </p>
+        </div>`
+            : ''
+        }
 
         ${statusLine()}
 
@@ -352,6 +575,26 @@ function render(): void {
               ).join('')}
             </select>
             <p class="hint">Düşük kbps = daha uzun ama daha boğuk ses.</p>
+          </div>
+          <div class="field">
+            <label for="boost">Ses yükseltme</label>
+            <select id="boost">
+              ${(['kapali', 'hafif', 'orta', 'guclu'] as BoostLevel[])
+                .map(
+                  (b) =>
+                    `<option value="${b}" ${b === state.boost ? 'selected' : ''}>${BOOST_LABEL[b]}</option>`,
+                )
+                .join('')}
+            </select>
+            <p class="hint">Kısık kayıtları duyulur hale getirir. Sesi yalnızca yükseltir, hiç kısmaz.</p>
+          </div>
+          <div class="field">
+            <label for="content">İçerik</label>
+            <select id="content">
+              <option value="konusma" ${state.content === 'konusma' ? 'selected' : ''}>Konuşma / insan sesi</option>
+              <option value="muzik" ${state.content === 'muzik' ? 'selected' : ''}>Müzik / diğer</option>
+            </select>
+            <p class="hint">Konuşma modu insan sesini belirgin netleştirir, müzikte boğuklaştırır.</p>
           </div>
           <div class="field">
             <label for="ec">Hata düzeltme</label>
@@ -409,12 +652,14 @@ function bind(root: HTMLElement): void {
     const action = target.closest('[data-action]')?.getAttribute('data-action');
     if (!action) return;
 
+    if (action === 'trim') trimCurrentSelection();
+    if (action === 'cut-toggle') toggleCut();
     if (action === 'preview') void playSelection();
     if (action === 'generate') void generate();
     if (action === 'png') void download('png');
     if (action === 'svg') void download('svg');
     if (action === 'copy' && state.result) {
-      void navigator.clipboard.writeText(state.result.publicUrl).then(
+      void navigator.clipboard.writeText(urlText(state.result.publicUrl)).then(
         () => {
           (target as HTMLButtonElement).textContent = 'Kopyalandı';
           setTimeout(() => ((target as HTMLButtonElement).textContent = 'Linki kopyala'), 1500);
@@ -440,6 +685,16 @@ function bind(root: HTMLElement): void {
       clampSelectionToBudget();
       render();
     }
+    if (target.id === 'boost') {
+      state.boost = (target as HTMLSelectElement).value as BoostLevel;
+      state.result = null;
+      render();
+    }
+    if (target.id === 'content') {
+      state.content = (target as HTMLSelectElement).value as ContentKind;
+      state.result = null;
+      render();
+    }
     if (target.id === 'ec') {
       state.ec = (target as HTMLSelectElement).value as EcLevel;
       state.result = null;
@@ -453,6 +708,26 @@ function bind(root: HTMLElement): void {
   root.addEventListener('input', (event) => {
     const target = event.target as HTMLInputElement;
     if (!state.buffer) return;
+
+    if (target.id === 'cut-start' || target.id === 'cut-length') {
+      const startEl = document.getElementById('cut-start') as HTMLInputElement | null;
+      const lengthEl = document.getElementById('cut-length') as HTMLInputElement | null;
+      if (!startEl || !lengthEl) return;
+
+      // Atilan bolum secimin ICINDE kalmali - disari tasan kisim zaten
+      // QR'a girmiyor, kullaniciyi yaniltmayalim.
+      const sel = state.selection;
+      const start = sel.start + (Number(startEl.value) / 1000) * (sel.end - sel.start);
+      const width = (Number(lengthEl.value) / 1000) * (sel.end - sel.start);
+
+      state.cut = {
+        start: Math.min(start, sel.end),
+        end: Math.min(sel.end, start + width),
+      };
+      state.result = null;
+      render();
+      return;
+    }
 
     if (target.id === 'start' || target.id === 'length') {
       const startEl = document.getElementById('start') as HTMLInputElement | null;

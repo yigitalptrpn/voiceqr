@@ -22,9 +22,29 @@ import {
  */
 const ENCODER_PADDING_PACKETS = 1;
 
+/**
+ * Opus'un neyi kodladigini bilmesi kaliteyi belirgin degistirir - ozellikle
+ * 6 kbps gibi asiri dusuk hizlarda.
+ *
+ * `konusma`: SILK konusma katmanini zorlar. Insan sesi cok daha anlasilir
+ *   cikar; muzikte ise bogurtu yapar.
+ * `muzik`: genel amacli mod. Tarayicinin varsayilani buydu.
+ */
+export type ContentKind = 'konusma' | 'muzik';
+
 export interface EncodeOptions {
   /** Hedef bit hizi (bit/saniye). 6000 en uzun sesi, 24000 en temiz sesi verir. */
   bitrate: number;
+  /** Kodlayiciya ne kodladigini soyler. Bkz. `ContentKind`. */
+  content: ContentKind;
+  /**
+   * VBR denensin mi? VBR'de sessizlik neredeyse bedava, bitler sesin oldugu
+   * yere gider - ayni bit hizinda belirgin kalite farki. Ama container her
+   * VBR paketinin onune 1 baytlik uzunluk yaziyor, yani paket 255 bayti
+   * asamaz. 60 ms cerceve ve 24+ kbps'te ortalama paket zaten 180 bayt
+   * civari, tepeler siniri asiyor - o durumda otomatik CBR'e donuluyor.
+   */
+  preferVbr?: boolean;
   frameDurationUs: FrameDurationUs;
   sampleRate: SampleRate;
   /** QR'a sigacak azami paketlenmis boyut. Asilirsa sondaki paketler atilir. */
@@ -33,6 +53,8 @@ export interface EncodeOptions {
 
 export interface EncodeResult {
   payload: VoicePayload;
+  /** Gercekten VBR kullanildi mi? `preferVbr` istense de dusulmus olabilir. */
+  usedVbr: boolean;
   /** Paketlenmis, base64url'e hazir baytlar. */
   bytes: Uint8Array;
   /** Yuke gercekten giren ses suresi (saniye). */
@@ -47,16 +69,26 @@ export function isEncodingSupported(): boolean {
   return typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined';
 }
 
-function encoderConfig(o: EncodeOptions): AudioEncoderConfig {
+function encoderConfig(o: EncodeOptions, vbr = false): AudioEncoderConfig {
   return {
     codec: 'opus',
     sampleRate: o.sampleRate,
     numberOfChannels: 1,
     bitrate: o.bitrate,
-    // Sabit bit hizi sayesinde her paket ayni boyutta cikar; boylece yukte
-    // paket basina uzunluk bayti tasimamiza gerek kalmaz (~%2 tasarruf).
-    bitrateMode: 'constant',
-    opus: { frameDuration: o.frameDurationUs, complexity: 10 },
+    // CBR'de her paket ayni boyutta cikar; boylece yukte paket basina uzunluk
+    // bayti tasimamiza gerek kalmaz (~%2 tasarruf). VBR bu tasarrufu verir
+    // ama kaliteyi artirir - hangisinin kazandigi bit hizina bagli.
+    bitrateMode: vbr ? 'variable' : 'constant',
+    opus: {
+      frameDuration: o.frameDurationUs,
+      complexity: 10,
+      // `application` kodlayicinin ic mimarisini secer, `signal` ise ayni
+      // yonde bir ipucu. Ikisi birlikte veriliyor cunku tek basina `signal`
+      // modu degistirmiyor - yalnizca ayar oynuyor.
+      ...(o.content === 'konusma'
+        ? { application: 'voip', signal: 'voice' }
+        : { application: 'audio', signal: 'music' }),
+    },
   } as AudioEncoderConfig;
 }
 
@@ -83,7 +115,64 @@ export async function encodeToPayload(pcm: Float32Array<ArrayBuffer>, options: E
   }
   if (pcm.length === 0) throw new EncodeError('Kodlanacak ses seçilmedi.');
 
-  const config = encoderConfig(options);
+  // VBR once denenir, ama yalnizca SORUNSUZ oldugunda kullanilir. Iki
+  // durumda CBR'e donulur:
+  //
+  //  1. Paketlerden biri 255 bayti asiyorsa - container onu tasiyamaz
+  //     (bkz. `preferVbr`).
+  //  2. Yuk butceye sigmiyorsa. Butce hesabi (`estimateSeconds`) CBR'in
+  //     sabit paket boyutuna dayaniyor; VBR bundan buyuk cikarsa ses sondan
+  //     kirpilirdi. Ustelik ne kadar buyuyecegi kodlayici surumune ve
+  //     isletim sistemine gore degisiyor - ayni girdi farkli makinelerde
+  //     farkli sure verirdi. CBR'e donmek sonucu ongorulebilir kiliyor;
+  //     VBR bir bonus, garanti degil.
+  let usedVbr = options.preferVbr === true;
+  let packets = usedVbr ? await encodePackets(pcm, options, true) : [];
+
+  const vbrUnusable =
+    usedVbr && (packets.some((p) => p.length > 255) || packedSize(packets) > options.maxBytes);
+
+  if (!usedVbr || vbrUnusable) {
+    usedVbr = false;
+    packets = await encodePackets(pcm, options, false);
+  }
+
+  // Butceye sigdir: sondan paket atarak kus. CBR'de paketler sabit boyutlu
+  // oldugu icin bu islem tam ve ongorulebilir.
+  const total = packets.length;
+  let kept = packets;
+  while (kept.length > 0 && packedSize(kept) > options.maxBytes) {
+    kept = kept.slice(0, kept.length - 1);
+  }
+  if (kept.length === 0) {
+    throw new EncodeError(
+      'Seçilen ses bu ayarlarla QR koda hiç sığmıyor. Bit hızını düşürün veya hata düzeltme seviyesini L yapın.',
+    );
+  }
+
+  const payload: VoicePayload = {
+    sampleRate: options.sampleRate,
+    channels: 1,
+    frameDurationUs: options.frameDurationUs,
+    packets: kept,
+  };
+
+  return {
+    payload,
+    usedVbr,
+    bytes: pack(payload),
+    encodedSeconds: (kept.length * options.frameDurationUs) / 1e6,
+    truncated: kept.length < total,
+  };
+}
+
+/** Tek bir kodlama turu. VBR geri dususu icin iki kez cagrilabilir. */
+async function encodePackets(
+  pcm: Float32Array<ArrayBuffer>,
+  options: EncodeOptions,
+  vbr: boolean,
+): Promise<Uint8Array[]> {
+  const config = encoderConfig(options, vbr);
   const support = await AudioEncoder.isConfigSupported(config);
   if (!support.supported) {
     throw new EncodeError(
@@ -126,33 +215,7 @@ export async function encodeToPayload(pcm: Float32Array<ArrayBuffer>, options: E
 
   if (encoderError) throw new EncodeError(`Ses kodlanamadı: ${(encoderError as Error).message}`);
   if (packets.length === 0) throw new EncodeError('Kodlayıcı hiç ses verisi üretmedi.');
-
-  // Butceye sigdir: sondan paket atarak kus. CBR'de paketler sabit boyutlu
-  // oldugu icin bu islem tam ve ongorulebilir.
-  const total = packets.length;
-  let kept = packets;
-  while (kept.length > 0 && packedSize(kept) > options.maxBytes) {
-    kept = kept.slice(0, kept.length - 1);
-  }
-  if (kept.length === 0) {
-    throw new EncodeError(
-      'Seçilen ses bu ayarlarla QR koda hiç sığmıyor. Bit hızını düşürün veya hata düzeltme seviyesini L yapın.',
-    );
-  }
-
-  const payload: VoicePayload = {
-    sampleRate: options.sampleRate,
-    channels: 1,
-    frameDurationUs: options.frameDurationUs,
-    packets: kept,
-  };
-
-  return {
-    payload,
-    bytes: pack(payload),
-    encodedSeconds: (kept.length * options.frameDurationUs) / 1e6,
-    truncated: kept.length < total,
-  };
+  return packets;
 }
 
 /**

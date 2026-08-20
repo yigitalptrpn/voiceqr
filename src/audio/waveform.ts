@@ -38,9 +38,14 @@ export interface DrawOptions {
   peaks: WaveformPeaks;
   /** Secilen aralik, 0..1 orani olarak. */
   selection: { start: number; end: number };
+  /** Secimin icinden ATILAN aralik; yoksa `null`. */
+  cut?: { start: number; end: number } | null;
   waveColor: string;
   selectedWaveColor: string;
   selectionFill: string;
+  /** Atilan bolumun dalga rengi - secilinin aksine soluk. */
+  cutWaveColor?: string;
+  cutFill?: string;
 }
 
 export function drawWaveform(canvas: HTMLCanvasElement, options: DrawOptions): void {
@@ -71,11 +76,25 @@ export function drawWaveform(canvas: HTMLCanvasElement, options: DrawOptions): v
   ctx.fillStyle = options.selectionFill;
   ctx.fillRect(selStartPx, 0, selEndPx - selStartPx, cssHeight);
 
+  const cut = options.cut ?? null;
+  const cutStartPx = cut ? cut.start * cssWidth : 0;
+  const cutEndPx = cut ? cut.end * cssWidth : 0;
+  if (cut && options.cutFill) {
+    ctx.fillStyle = options.cutFill;
+    ctx.fillRect(cutStartPx, 0, cutEndPx - cutStartPx, cssHeight);
+  }
+
   const barWidth = cssWidth / buckets;
   for (let b = 0; b < buckets; b++) {
     const x = b * barWidth;
-    const inSelection = x + barWidth / 2 >= selStartPx && x + barWidth / 2 <= selEndPx;
-    ctx.fillStyle = inSelection ? options.selectedWaveColor : options.waveColor;
+    const barCenter = x + barWidth / 2;
+    const inSelection = barCenter >= selStartPx && barCenter <= selEndPx;
+    const inCut = cut !== null && barCenter >= cutStartPx && barCenter <= cutEndPx;
+    ctx.fillStyle = inCut
+      ? (options.cutWaveColor ?? options.waveColor)
+      : inSelection
+        ? options.selectedWaveColor
+        : options.waveColor;
     const top = mid - peaks.max[b]! * scale;
     const bottom = mid - peaks.min[b]! * scale;
     ctx.fillRect(x, top, Math.max(barWidth - 0.5, 0.5), Math.max(bottom - top, 1));

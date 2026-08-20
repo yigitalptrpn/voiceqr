@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { readBarcodesFromImageFile, setZXingModuleOverrides } from 'zxing-wasm/reader';
+import { maxAlphanumericChars } from '../../src/qr/capacity';
 import { dominantFrequency, makeWav, parseWav, rms, tone } from './helpers';
 
 const require = createRequire(import.meta.url);
@@ -19,6 +20,7 @@ test.beforeAll(async () => {
 });
 
 const SAMPLE_RATE = 16000;
+const URL_PREFIX = 'https://yigitalptrpn.github.io/voiceqr/#';
 
 async function uploadTone(page: Page, frequency: number, seconds: number): Promise<void> {
   await page.goto('./');
@@ -80,8 +82,14 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
 
     // QR, yerel adresi degil YAYINDAKI adresi tasimali - basilan kod
     // herkeste calismali.
-    expect(scanned).toContain('https://yigitalptrpn.github.io/voiceqr/#');
-    expect(scanned.length).toBeLessThanOrEqual(2953);
+    expect(scanned).toContain(URL_PREFIX);
+
+    // Yuk alfanumerik segmentte tasindigi icin adres, bayt modunun 2953
+    // karakterlik sinirini ASABILIR - QR'in alfanumerik kapasitesi daha genis.
+    // Sinir, kapasite matematiginin ilan ettigi kadar olmali.
+    const limit = URL_PREFIX.length + maxAlphanumericChars(URL_PREFIX.length, 'L');
+    expect(scanned.length).toBeLessThanOrEqual(limit);
+    expect(scanned.length).toBeGreaterThan(2953);
 
     const shown = await page.locator('.url-details summary').textContent();
     expect(shown).toContain(String(scanned.length));
@@ -110,7 +118,7 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
     expect(rms(middle)).toBeGreaterThan(0.2);
   });
 
-  test('varsayilan ayar (6 kbps / EC-L) yaklasik 2.9 saniye ses tasiyor', async ({ page }) => {
+  test('varsayilan ayar (6 kbps / EC-L) yaklasik 3.7 saniye ses tasiyor', async ({ page }) => {
     await uploadTone(page, 440, 10);
     await generate(page);
 
@@ -120,9 +128,11 @@ test.describe('Ses -> QR -> ses gidis donusu', () => {
     const scanned = await scanGeneratedQr(page);
     const { channels, sampleRate } = await playbackAudio(page, scanned.split('#')[1]!);
 
+    // base43 + alfanumerik QR modu kapasiteyi ~%29 buyuttu: eskiden 2.9 sn
+    // olan bu deger 3.7 sn'ye cikti. Gerileme olursa bu test yakalar.
     const seconds = channels[0]!.length / sampleRate;
-    expect(seconds).toBeGreaterThan(2.7);
-    expect(seconds).toBeLessThan(3.1);
+    expect(seconds).toBeGreaterThan(3.5);
+    expect(seconds).toBeLessThan(3.9);
     expect(rms(channels[0]!)).toBeGreaterThan(0.05);
   });
 
@@ -164,5 +174,105 @@ test.describe('Oynatici hata durumlari', () => {
   test('fragment yoksa uretici acilir', async ({ page }) => {
     await page.goto('./');
     await expect(page.getByRole('heading', { name: '1. Ses dosyası seçin' })).toBeVisible();
+  });
+});
+
+/**
+ * Ortadan parca atma. Kanit icin uc parcali bir ton kullaniliyor:
+ * 300 Hz - 900 Hz - 300 Hz. Ortadaki atilirsa cikan seste 900 Hz KALMAMALI.
+ * "Bir sey kesildi" degil, "dogru yer kesildi" dogrulaniyor.
+ */
+test.describe('Ortadan parca atma', () => {
+  function ucParcaliTon(): Buffer {
+    const parcalar = [tone(300, 1, SAMPLE_RATE), tone(900, 1, SAMPLE_RATE), tone(300, 1, SAMPLE_RATE)];
+    const toplam = new Float32Array(parcalar.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (const p of parcalar) {
+      toplam.set(p, o);
+      o += p.length;
+    }
+    return makeWav(toplam, SAMPLE_RATE);
+  }
+
+  async function kur(page: Page): Promise<void> {
+    await page.goto('./');
+    await page.setInputFiles('#file', {
+      name: 'uc-parcali.wav',
+      mimeType: 'audio/wav',
+      buffer: ucParcaliTon(),
+    });
+    await expect(page.locator('#wave-canvas')).toBeVisible();
+    await page.selectOption('#bitrate', '6000');
+    await page.selectOption('#boost', 'kapali');
+
+    // Tum dosyayi sec - 6 kbps'te 3.6 sn siginiyor, 3 sn'lik dosya tamamen giriyor.
+    await page.locator('#start').fill('0');
+    await page.locator('#start').dispatchEvent('input');
+    await page.locator('#length').fill('1000');
+    await page.locator('#length').dispatchEvent('input');
+  }
+
+  async function sesiAl(page: Page) {
+    await generate(page);
+    const scanned = await scanGeneratedQr(page);
+    return playbackAudio(page, scanned.split('#')[1]!);
+  }
+
+  test('atilan bolum sesten GERCEKTEN cikiyor', async ({ page }) => {
+    await kur(page);
+
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    // Secimin %33-%66 araligi = ortadaki 900 Hz'lik saniye.
+    await page.locator('#cut-start').fill('333');
+    await page.locator('#cut-start').dispatchEvent('input');
+    await page.locator('#cut-length').fill('334');
+    await page.locator('#cut-length').dispatchEvent('input');
+
+    const { channels, sampleRate } = await sesiAl(page);
+    const signal = channels[0]!;
+
+    // 3 sn'den 1 sn atildi.
+    expect(signal.length / sampleRate).toBeGreaterThan(1.9);
+    expect(signal.length / sampleRate).toBeLessThan(2.2);
+
+    // Geriye yalnizca 300 Hz kalmali - 900 Hz atildi.
+    const baskin = dominantFrequency(signal, sampleRate, { min: 200, max: 1200, step: 5 });
+    expect(baskin).toBeGreaterThan(250);
+    expect(baskin).toBeLessThan(350);
+  });
+
+  test('atma kapaliyken ses tam kaliyor', async ({ page }) => {
+    await kur(page);
+    const { channels, sampleRate } = await sesiAl(page);
+    expect(channels[0]!.length / sampleRate).toBeGreaterThan(2.9);
+  });
+
+  test('atilan bolum butceden dusuluyor', async ({ page }) => {
+    await kur(page);
+    const oncesi = await page.locator('.metrics strong').first().textContent();
+
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    await page.locator('#cut-start').fill('333');
+    await page.locator('#cut-start').dispatchEvent('input');
+    await page.locator('#cut-length').fill('334');
+    await page.locator('#cut-length').dispatchEvent('input');
+
+    const sonrasi = await page.locator('.metrics strong').first().textContent();
+
+    // "Secili" degeri atilan sure kadar dusmeli: 3.00 -> 2.00
+    expect(parseFloat(oncesi!)).toBeGreaterThan(2.9);
+    expect(parseFloat(sonrasi!)).toBeLessThan(2.2);
+  });
+
+  test('iptal edilince ses tekrar tam oluyor', async ({ page }) => {
+    await kur(page);
+    await page.getByRole('button', { name: 'Ortadan parça at' }).click();
+    await expect(page.locator('#cut-start')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Ortadan atmayı iptal et' }).click();
+    await expect(page.locator('#cut-start')).toHaveCount(0);
+
+    const { channels, sampleRate } = await sesiAl(page);
+    expect(channels[0]!.length / sampleRate).toBeGreaterThan(2.9);
   });
 });

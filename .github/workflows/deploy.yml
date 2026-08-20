@@ -41,8 +41,10 @@ jobs:
 
   deploy:
     name: Yayınla
-    # Yalnızca main'e push edildiğinde ve testler geçtiğinde yayınla.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Yalnızca main'de ve testler geçtiğinde yayınla. Push'un yani sıra elle
+    # tetiklemeye de izin veriliyor - aksi halde "Run workflow" testleri koşup
+    # yayınlamadan biterdi.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -60,7 +62,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      # `enablement`, Pages kapaliysa onu API uzerinden acar; boylece depo
+      # ayarlarindan elle "Source: GitHub Actions" secmek gerekmez. Yalnizca
+      # Pages'e uygun depolarda (herkese acik ya da ucretli plan) calisir.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist

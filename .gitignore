@@ -7,3 +7,13 @@ blob-report/
 .DS_Store
 *.local
 .vite/
+
+# Kisisel ses/video kayitlari ve uretilen ciktilar - depo herkese acik,
+# bunlar ASLA gonderilmemeli.
+Ses1/
+*.zip
+
+# Yerel tani testi: gercek Chrome ve Ses1/ klasoru gerektirir, CI'da kosarsa
+# yayinlamayi bloklar.
+tests/e2e/ses1-real.spec.ts
+.claude/
