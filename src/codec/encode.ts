@@ -115,12 +115,24 @@ export async function encodeToPayload(pcm: Float32Array<ArrayBuffer>, options: E
   }
   if (pcm.length === 0) throw new EncodeError('Kodlanacak ses seçilmedi.');
 
-  // VBR once denenir. Paketlerden biri 255 bayti asarsa container onu
-  // tasiyamaz (bkz. `preferVbr`), o zaman sessizce CBR'e donulur.
+  // VBR once denenir, ama yalnizca SORUNSUZ oldugunda kullanilir. Iki
+  // durumda CBR'e donulur:
+  //
+  //  1. Paketlerden biri 255 bayti asiyorsa - container onu tasiyamaz
+  //     (bkz. `preferVbr`).
+  //  2. Yuk butceye sigmiyorsa. Butce hesabi (`estimateSeconds`) CBR'in
+  //     sabit paket boyutuna dayaniyor; VBR bundan buyuk cikarsa ses sondan
+  //     kirpilirdi. Ustelik ne kadar buyuyecegi kodlayici surumune ve
+  //     isletim sistemine gore degisiyor - ayni girdi farkli makinelerde
+  //     farkli sure verirdi. CBR'e donmek sonucu ongorulebilir kiliyor;
+  //     VBR bir bonus, garanti degil.
   let usedVbr = options.preferVbr === true;
-  let packets = await encodePackets(pcm, options, usedVbr);
+  let packets = usedVbr ? await encodePackets(pcm, options, true) : [];
 
-  if (usedVbr && packets.some((p) => p.length > 255)) {
+  const vbrUnusable =
+    usedVbr && (packets.some((p) => p.length > 255) || packedSize(packets) > options.maxBytes);
+
+  if (!usedVbr || vbrUnusable) {
     usedVbr = false;
     packets = await encodePackets(pcm, options, false);
   }
