@@ -22,9 +22,21 @@ import {
  */
 const ENCODER_PADDING_PACKETS = 1;
 
+/**
+ * Opus'un neyi kodladigini bilmesi kaliteyi belirgin degistirir - ozellikle
+ * 6 kbps gibi asiri dusuk hizlarda.
+ *
+ * `konusma`: SILK konusma katmanini zorlar. Insan sesi cok daha anlasilir
+ *   cikar; muzikte ise bogurtu yapar.
+ * `muzik`: genel amacli mod. Tarayicinin varsayilani buydu.
+ */
+export type ContentKind = 'konusma' | 'muzik';
+
 export interface EncodeOptions {
   /** Hedef bit hizi (bit/saniye). 6000 en uzun sesi, 24000 en temiz sesi verir. */
   bitrate: number;
+  /** Kodlayiciya ne kodladigini soyler. Bkz. `ContentKind`. */
+  content: ContentKind;
   frameDurationUs: FrameDurationUs;
   sampleRate: SampleRate;
   /** QR'a sigacak azami paketlenmis boyut. Asilirsa sondaki paketler atilir. */
@@ -56,7 +68,16 @@ function encoderConfig(o: EncodeOptions): AudioEncoderConfig {
     // Sabit bit hizi sayesinde her paket ayni boyutta cikar; boylece yukte
     // paket basina uzunluk bayti tasimamiza gerek kalmaz (~%2 tasarruf).
     bitrateMode: 'constant',
-    opus: { frameDuration: o.frameDurationUs, complexity: 10 },
+    opus: {
+      frameDuration: o.frameDurationUs,
+      complexity: 10,
+      // `application` kodlayicinin ic mimarisini secer, `signal` ise ayni
+      // yonde bir ipucu. Ikisi birlikte veriliyor cunku tek basina `signal`
+      // modu degistirmiyor - yalnizca ayar oynuyor.
+      ...(o.content === 'konusma'
+        ? { application: 'voip', signal: 'voice' }
+        : { application: 'audio', signal: 'music' }),
+    },
   } as AudioEncoderConfig;
 }
 

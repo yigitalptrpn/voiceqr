@@ -9,10 +9,11 @@
 
 import { currentUrlPrefix, publicUrlPrefix } from './config';
 import { getAudioContext, loadAudioFile, resumeAudioContext } from './audio/loadFile';
+import { BOOST_LABEL, normalizeInPlace, type BoostLevel } from './audio/normalize';
 import { extractMono } from './audio/resample';
 import { computePeaks, drawWaveform, type WaveformPeaks } from './audio/waveform';
 import { encodeBase64url } from './codec/base64url';
-import { encodeToPayload, estimateSeconds, isEncodingSupported } from './codec/encode';
+import { encodeToPayload, estimateSeconds, isEncodingSupported, type ContentKind } from './codec/encode';
 import type { FrameDurationUs, SampleRate } from './codec/container';
 import { EC_LABEL, maxPayloadBytes, type EcLevel } from './qr/capacity';
 import { measureQr, renderToCanvas, toPngBlob, toSvgString, type QrRenderResult } from './qr/render';
@@ -31,6 +32,10 @@ interface State {
   selection: { start: number; end: number };
   bitrate: number;
   ec: EcLevel;
+  /** Kodlayiciya verilen icerik ipucu; kaliteyi belirgin etkiler. */
+  content: ContentKind;
+  /** Kodlamadan onceki ses yukseltme seviyesi. */
+  boost: BoostLevel;
   /** Uretilmis link ve olcumleri; ayar degisince temizlenir. */
   result: { url: string; publicUrl: string; qr: QrRenderResult; seconds: number; truncated: boolean } | null;
   busy: boolean;
@@ -44,6 +49,8 @@ const state: State = {
   selection: { start: 0, end: 1 },
   bitrate: 6000,
   ec: 'L',
+  content: 'konusma',
+  boost: 'orta',
   result: null,
   busy: false,
   error: null,
@@ -118,8 +125,13 @@ async function generate(): Promise<void> {
       targetSampleRate: SAMPLE_RATE,
     });
 
+    // Kisik kayit telefon hoparlorunde duyulmaz. Yukseltme ortalama gurluge
+    // gore yapiliyor; ayrintisi ve neden tepeye gore olmadigi normalize.ts'te.
+    normalizeInPlace(pcm, state.boost);
+
     const encoded = await encodeToPayload(pcm, {
       bitrate: state.bitrate,
+      content: state.content,
       frameDurationUs: FRAME_DURATION,
       sampleRate: SAMPLE_RATE,
       maxBytes: budgetBytes(),
@@ -356,6 +368,26 @@ function render(): void {
             <p class="hint">Düşük kbps = daha uzun ama daha boğuk ses.</p>
           </div>
           <div class="field">
+            <label for="boost">Ses yükseltme</label>
+            <select id="boost">
+              ${(['kapali', 'hafif', 'orta', 'guclu'] as BoostLevel[])
+                .map(
+                  (b) =>
+                    `<option value="${b}" ${b === state.boost ? 'selected' : ''}>${BOOST_LABEL[b]}</option>`,
+                )
+                .join('')}
+            </select>
+            <p class="hint">Kısık kayıtları duyulur hale getirir. Sesi yalnızca yükseltir, hiç kısmaz.</p>
+          </div>
+          <div class="field">
+            <label for="content">İçerik</label>
+            <select id="content">
+              <option value="konusma" ${state.content === 'konusma' ? 'selected' : ''}>Konuşma / insan sesi</option>
+              <option value="muzik" ${state.content === 'muzik' ? 'selected' : ''}>Müzik / diğer</option>
+            </select>
+            <p class="hint">Konuşma modu insan sesini belirgin netleştirir, müzikte boğuklaştırır.</p>
+          </div>
+          <div class="field">
             <label for="ec">Hata düzeltme</label>
             <select id="ec">
               ${(['L', 'M', 'Q', 'H'] as EcLevel[])
@@ -440,6 +472,16 @@ function bind(root: HTMLElement): void {
       state.bitrate = Number((target as HTMLSelectElement).value);
       state.result = null;
       clampSelectionToBudget();
+      render();
+    }
+    if (target.id === 'boost') {
+      state.boost = (target as HTMLSelectElement).value as BoostLevel;
+      state.result = null;
+      render();
+    }
+    if (target.id === 'content') {
+      state.content = (target as HTMLSelectElement).value as ContentKind;
+      state.result = null;
       render();
     }
     if (target.id === 'ec') {
