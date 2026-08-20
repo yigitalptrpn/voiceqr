@@ -306,7 +306,9 @@ function render(): void {
       <section class="panel">
         <h2>1. Ses dosyası seçin</h2>
         <div id="drop" class="drop ${hasAudio ? 'has-file' : ''}" tabindex="0" role="button">
-          <input type="file" id="file" accept="audio/*" hidden />
+          <!-- Video de kabul ediliyor: decodeAudioData, mp4/mov icindeki ses
+               parcasini cozer, telefon kayitlari cogunlukla bu bicimde gelir. -->
+          <input type="file" id="file" accept="audio/*,video/*" hidden />
           ${
             hasAudio
               ? `<strong>${state.file?.name ?? 'ses'}</strong>
@@ -314,7 +316,7 @@ function render(): void {
                  ${state.buffer!.sampleRate} Hz</span>
                  <span class="hint">Değiştirmek için tıklayın veya yeni dosya bırakın</span>`
               : `<strong>Dosyayı buraya bırakın</strong>
-                 <span>ya da tıklayıp seçin (mp3, m4a, wav, ogg...)</span>`
+                 <span>ya da tıklayıp seçin (mp3, m4a, wav, ogg, mp4...)</span>`
           }
         </div>
       </section>
